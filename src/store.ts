@@ -1,7 +1,9 @@
-import { createInitialState } from './data';
-import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
+import { createBundledBaseMap, createInitialState } from './data';
+import { allConflictsResolved, buildMergeReport, bundleFromState, resolveConflict, validateBundle } from './merge';
+import type { ComponentSnapshot, ComponentSpec, MergeReport, MergeSide, PendingMerge, SpecBundle, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
+const PENDING_MERGE_KEY = 'sologsb-1028-pending-merge-v1';
 
 const clone = <T>(value: T): T => structuredClone(value);
 const uid = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -9,13 +11,17 @@ const signature = (component: ComponentSpec) => `${component.properties.map((ite
 
 export class SpecStore extends EventTarget {
   state: WorkspaceState;
+  /** 未提交的合并：双方草稿都保留在这里，选定前不动正式规范 */
+  pendingMerge: PendingMerge | null = null;
   private undoStack: WorkspaceState[] = [];
   private redoStack: WorkspaceState[] = [];
   private lastAction = '';
+  private readonly bundledBases = createBundledBaseMap();
 
   constructor() {
     super();
     this.state = this.load();
+    this.pendingMerge = this.loadPendingMerge();
   }
 
   get selected(): ComponentSpec | undefined {
@@ -25,6 +31,11 @@ export class SpecStore extends EventTarget {
   get canUndo() { return this.undoStack.length > 0; }
   get canRedo() { return this.redoStack.length > 0; }
   get lastUndoLabel() { return this.lastAction; }
+  get hasPendingMerge() { return this.pendingMerge !== null; }
+  get pendingReport(): MergeReport | null { return this.pendingMerge?.report ?? null; }
+  get pendingConflictsResolved(): boolean {
+    return !!this.pendingMerge && allConflictsResolved(this.pendingMerge.report);
+  }
 
   select(id: string) {
     if (!this.state.components.some((item) => item.id === id)) return;
@@ -196,6 +207,97 @@ export class SpecStore extends EventTarget {
     });
   }
 
+  /* ------------------------------ 离线稿合并 ------------------------------ */
+
+  /** 导出当前正式规范，供断网维护者带走 */
+  exportBundle(): SpecBundle {
+    return bundleFromState(this.state);
+  }
+
+  exportBundleJson(): string {
+    return JSON.stringify(this.exportBundle(), null, 2);
+  }
+
+  /**
+   * 读入维护者带回的稿包并做三方合并：
+   * 无冲突可以直接提交；有冲突则挂起为待决合并，双方草稿都保留、允许重试。
+   */
+  importBundle(input: unknown): { ok: boolean; error?: string; report?: MergeReport } {
+    const checked = validateBundle(input);
+    if (!checked.ok) return { ok: false, error: checked.error };
+    try {
+      const report = buildMergeReport(this.state, checked.bundle, this.bundledBases);
+      this.pendingMerge = {
+        id: uid('merge'),
+        startedAt: new Date().toISOString(),
+        incoming: checked.bundle,
+        report
+      };
+      this.persistPendingMerge();
+      this.emit();
+      return { ok: true, report };
+    } catch (error) {
+      return { ok: false, error: `合并失败：${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
+  /** 维护者为一条冲突选择本机稿或带回稿；仅更新待决草稿 */
+  chooseConflictSide(conflictId: string, side: MergeSide) {
+    if (!this.pendingMerge) return;
+    const report = resolveConflict(this.pendingMerge.report, conflictId, side, this.bundledBases);
+    this.pendingMerge = { ...this.pendingMerge, report };
+    this.persistPendingMerge();
+    this.emit();
+  }
+
+  /** 冲突全部选定后把合并结果写入正式规范；未选定完不允许提交 */
+  commitMerge(reason = '离线稿合并'): { ok: boolean; error?: string } {
+    const pending = this.pendingMerge;
+    if (!pending) return { ok: false, error: '没有待提交的合并。' };
+    if (!allConflictsResolved(pending.report)) {
+      return { ok: false, error: '仍有冲突未选定，正式规范保持不变。' };
+    }
+    const before = clone(this.state);
+    const next = clone(pending.report.merged);
+    next.components = next.components.map((component) => ({
+      ...component,
+      revision: component.revision + 1,
+      updatedAt: new Date().toISOString()
+    }));
+    this.undoStack.push(before);
+    this.undoStack = this.undoStack.slice(-40);
+    this.redoStack = [];
+    this.lastAction = reason;
+    this.state = next;
+    this.pendingMerge = null;
+    localStorage.removeItem(PENDING_MERGE_KEY);
+    this.persist();
+    this.emit();
+    return { ok: true };
+  }
+
+  /** 放弃本次挂起合并（带回稿可稍后重新导入），正式规范不变 */
+  discardPendingMerge() {
+    if (!this.pendingMerge) return;
+    this.pendingMerge = null;
+    localStorage.removeItem(PENDING_MERGE_KEY);
+    this.emit();
+  }
+
+  /** 用原始双方草稿重新计算一次合并（失败后的重试入口） */
+  retryMerge(): { ok: boolean; error?: string } {
+    if (!this.pendingMerge) return { ok: false, error: '没有可重试的合并。' };
+    try {
+      const report = buildMergeReport(this.state, this.pendingMerge.incoming, this.bundledBases);
+      this.pendingMerge = { ...this.pendingMerge, report, startedAt: new Date().toISOString() };
+      this.persistPendingMerge();
+      this.emit();
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, error: `重试失败：${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
+
   validate(): ValidationIssue[] {
     const issues: ValidationIssue[] = [];
     for (const component of this.state.components) {
@@ -251,6 +353,8 @@ export class SpecStore extends EventTarget {
     this.undoStack = [];
     this.redoStack = [];
     this.state = createInitialState();
+    this.pendingMerge = null;
+    localStorage.removeItem(PENDING_MERGE_KEY);
     this.persist(false);
     this.emit();
   }
@@ -280,6 +384,23 @@ export class SpecStore extends EventTarget {
 
   private persist(_notify = true) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(this.state));
+  }
+
+  private persistPendingMerge() {
+    if (this.pendingMerge) {
+      localStorage.setItem(PENDING_MERGE_KEY, JSON.stringify(this.pendingMerge));
+    } else {
+      localStorage.removeItem(PENDING_MERGE_KEY);
+    }
+  }
+
+  private loadPendingMerge(): PendingMerge | null {
+    try {
+      const saved = localStorage.getItem(PENDING_MERGE_KEY);
+      return saved ? (JSON.parse(saved) as PendingMerge) : null;
+    } catch {
+      return null;
+    }
   }
 
   private emit() {

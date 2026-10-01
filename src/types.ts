@@ -66,3 +66,63 @@ export interface DiffRow {
   before: string;
   after: string;
 }
+
+export type MergeSide = 'local' | 'incoming';
+export type MergeTarget = 'component' | 'property' | 'example';
+export type MergeConflictKind =
+  | 'both-modified'
+  | 'added-both'
+  | 'deleted-modified';
+
+export interface MergeConflict {
+  id: string;
+  componentId: string;
+  /** 组件级冲突等于 componentId，否则为属性或示例的稳定编号 */
+  itemId: string;
+  target: MergeTarget;
+  kind: MergeConflictKind;
+  /** 结构冲突（新增/删除）为空字符串 */
+  field: string;
+  label: string;
+  localLabel: string;
+  incomingLabel: string;
+  localValue: string;
+  incomingValue: string;
+  localRaw: unknown;
+  incomingRaw: unknown;
+  chosen: MergeSide | null;
+  /** 同名异编号结构冲突里，落选方的稳定编号（选定后剔除） */
+  otherItemId?: string;
+}
+
+export interface MergeChangeNote {
+  id: string;
+  level: 'auto' | 'stale' | 'info';
+  message: string;
+}
+
+/** 维护者断网后带回的整包稿 */
+export interface SpecBundle {
+  app: 'sologsb-1028';
+  exportedAt: string;
+  components: ComponentSpec[];
+}
+
+export interface MergeReport {
+  generatedAt: string;
+  /** 找到共同基线（快照或内置稿）、可做三方合并的组件 */
+  baseFoundFor: string[];
+  /** 没有共同基线、退回到保守二选一策略的组件 */
+  baseMissingFor: string[];
+  merged: WorkspaceState;
+  conflicts: MergeConflict[];
+  changes: MergeChangeNote[];
+  addedComponentIds: string[];
+}
+
+export interface PendingMerge {
+  id: string;
+  startedAt: string;
+  incoming: SpecBundle;
+  report: MergeReport;
+}

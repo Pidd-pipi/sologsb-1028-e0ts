@@ -114,3 +114,7 @@ export const createInitialState = (): WorkspaceState => ({
   components: structuredClone(components),
   selectedId: components[0].id
 });
+
+/** 内置出厂稿，三方合并找不到共同快照时作为基线 */
+export const createBundledBaseMap = (): Map<string, ComponentSpec> =>
+  new Map(structuredClone(components).map((component) => [component.id, component]));

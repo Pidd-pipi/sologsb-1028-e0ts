@@ -2,7 +2,8 @@ import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
 import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import type { ComponentExample, ComponentSpec, MergeConflict, MergeReport, MergeSide, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import { FIELD_LABELS } from './merge';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
 
@@ -13,7 +14,8 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    showMerge: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +25,7 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private showMerge = false;
   private toastTimer?: number;
 
   static styles = css`
@@ -116,6 +119,46 @@ export class SpecA11yWorkbench extends LitElement {
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
+    .merge-banner {
+      display: flex; align-items: center; gap: 12px; padding: 9px 22px;
+      background: var(--spectrum-orange-200); border-bottom: 1px solid var(--spectrum-orange-400);
+      font-size: 13px;
+    }
+    .merge-banner strong { white-space: nowrap; }
+    .merge-overlay {
+      position: fixed; inset: 0; z-index: 100; background: rgb(15 20 30 / .55);
+      display: grid; place-items: center; padding: 26px;
+    }
+    .merge-dialog {
+      width: min(980px, 100%); max-height: calc(100vh - 52px); overflow: hidden;
+      display: grid; grid-template-rows: auto auto 1fr auto;
+      background: var(--spectrum-gray-50); border-radius: 16px;
+      border: 1px solid var(--spectrum-gray-300); box-shadow: 0 24px 70px rgb(0 0 0 / .35);
+    }
+    .merge-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; padding: 20px 22px 12px; }
+    .merge-header h2 { margin: 0 0 6px; font-size: 20px; }
+    .merge-header p { margin: 0; color: var(--spectrum-gray-700); font-size: 12px; }
+    .merge-summary { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 22px 12px; }
+    .merge-body { overflow-y: auto; padding: 0 22px; display: grid; gap: 14px; }
+    .merge-body .panel h2 { margin-bottom: 10px; }
+    .change-list { margin: 0; padding-left: 18px; display: grid; gap: 5px; font-size: 12px; }
+    .change-list .stale { color: var(--spectrum-orange-700); }
+    .change-list .auto { color: var(--spectrum-gray-800); }
+    .conflict { border: 1px solid var(--spectrum-gray-300); border-radius: 12px; padding: 12px; margin-bottom: 12px; background: var(--spectrum-gray-100); }
+    .conflict.chosen-local, .conflict.chosen-incoming { border-color: var(--spectrum-blue-600); }
+    .conflict-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+    .conflict-head strong { flex: 1; min-width: 200px; }
+    .conflict-options { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .conflict-option {
+      text-align: left; border: 2px solid var(--spectrum-gray-300); border-radius: 10px;
+      background: var(--spectrum-gray-50); padding: 10px; cursor: pointer; font: inherit; color: inherit;
+    }
+    .conflict-option:hover { border-color: var(--spectrum-blue-500); }
+    .conflict-option.selected { border-color: var(--spectrum-blue-700); background: var(--spectrum-blue-100); }
+    .conflict-side { display: block; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+    .conflict-option pre { margin: 0; max-height: 190px; overflow: auto; font-size: 11px; }
+    .merge-footer { display: flex; align-items: center; gap: 10px; padding: 14px 22px; border-top: 1px solid var(--spectrum-gray-300); flex-wrap: wrap; }
+    .merge-footer .save-state { margin-right: auto; }
     @media (max-width: 1180px) {
       .layout { grid-template-columns: 230px minmax(0, 1fr); }
       .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--spectrum-gray-300); grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -174,6 +217,11 @@ export class SpecA11yWorkbench extends LitElement {
       this.store.addComponent();
       return;
     }
+    if (event.altKey && event.key.toLowerCase() === 'm') {
+      event.preventDefault();
+      if (this.store.hasPendingMerge) this.showMerge = true;
+      return;
+    }
     const tabMap: Record<string, EditorTab> = { '1': 'overview', '2': 'api', '3': 'accessibility', '4': 'examples', '5': 'history' };
     if (event.altKey && tabMap[event.key]) {
       event.preventDefault();
@@ -203,10 +251,14 @@ export class SpecA11yWorkbench extends LitElement {
               ></sp-search>
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
+              <sp-button variant="secondary" @click=${() => this.exportBundle()}>导出离线稿</sp-button>
+              <sp-button variant="secondary" @click=${() => this.pickBundleFile()}>导入合并</sp-button>
               <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
               <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
             </div>
           </header>
+          ${this.store.hasPendingMerge ? this.renderPendingBanner() : nothing}
+          <input type="file" accept="application/json,.json" hidden @change=${(event: Event) => this.onBundleFilePicked(event)} />
           <div class="layout">
             <aside class="sidebar" aria-label="组件目录">
               <div class="sidebar-heading">
@@ -232,6 +284,7 @@ export class SpecA11yWorkbench extends LitElement {
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
+          ${this.showMerge && this.store.pendingReport ? this.renderMergeDialog(this.store.pendingReport) : nothing}
           <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
         </div>
       </sp-theme>
@@ -458,6 +511,154 @@ export class SpecA11yWorkbench extends LitElement {
     } catch {
       this.flash('复制失败，请手动选择代码');
     }
+  }
+
+  /* ------------------------------ 离线稿合并 ------------------------------ */
+
+  private renderPendingBanner(): TemplateResult {
+    const report = this.store.pendingReport;
+    const unresolved = report ? report.conflicts.filter((item) => item.chosen === null).length : 0;
+    return html`
+      <div class="merge-banner" role="status">
+        <strong>有待完成的离线稿合并</strong>
+        <span>${report?.conflicts.length ?? 0} 处差异${unresolved ? `，${unresolved} 处待选定` : '，已全部选定'}。选定前正式规范不会被修改。</span>
+        <sp-button size="s" variant="accent" @click=${() => { this.showMerge = true; }}>${unresolved ? '继续选定' : '查看并提交'}</sp-button>
+      </div>
+    `;
+  }
+
+  private renderMergeDialog(report: MergeReport): TemplateResult {
+    const unresolved = report.conflicts.filter((item) => item.chosen === null).length;
+    const componentName = (id: string) => this.store.state.components.find((item) => item.id === id)?.name
+      ?? report.merged.components.find((item) => item.id === id)?.name ?? id;
+    return html`
+      <div class="merge-overlay" role="dialog" aria-modal="true" aria-label="离线稿合并">
+        <div class="merge-dialog">
+          <header class="merge-header">
+            <div>
+              <h2>合并离线稿</h2>
+              <p>带回稿导出于 ${new Date(this.store.pendingMerge?.incoming.exportedAt ?? report.generatedAt).toLocaleString('zh-CN')}。
+                无冲突改动已按稳定编号自动接上；下列差异需要你保留双方结果之一。</p>
+            </div>
+            <sp-action-button label="关闭" @click=${() => { this.showMerge = false; }}>✕</sp-action-button>
+          </header>
+          <div class="merge-summary">
+            <span class="pill published">自动接入 ${report.changes.filter((item) => item.level === 'auto').length} 处</span>
+            <span class="pill review">示例失效重算 ${report.changes.filter((item) => item.level === 'stale').length} 处</span>
+            <span class="pill ${unresolved ? 'review' : 'published'}">${unresolved ? `待选定 ${unresolved} 处` : '冲突已全部选定'}</span>
+            ${report.baseMissingFor.length ? html`<span class="pill review">${report.baseMissingFor.length} 个组件缺少共同基线</span>` : nothing}
+          </div>
+          <div class="merge-body">
+            ${report.changes.length ? html`
+              <section class="panel">
+                <h2>自动处理记录</h2>
+                <ul class="change-list">
+                  ${report.changes.map((change) => html`<li class="${change.level}">${change.message}</li>`)}
+                </ul>
+              </section>
+            ` : nothing}
+            <section class="panel">
+              <h2>需要保留双方结果的差异（${report.conflicts.length}）</h2>
+              ${report.conflicts.length ? report.conflicts.map((conflict) => this.renderConflict(conflict, componentName(conflict.componentId))) : html`<div class="issue info">两边改动没有落在同一处，全部自动合并完成。</div>`}
+            </section>
+          </div>
+          <footer class="merge-footer">
+            <sp-button variant="secondary" @click=${() => {
+              const result = this.store.retryMerge();
+              if (!result.ok) this.flash(result.error ?? '重试失败');
+              else this.flash('已按双方草稿重新计算');
+            }}>用双方草稿重试</sp-button>
+            <sp-button variant="secondary" @click=${() => { this.store.discardPendingMerge(); this.showMerge = false; this.flash('已放弃合并，双方草稿未写入正式规范'); }}>放弃合并</sp-button>
+            <span class="save-state">${unresolved ? `还有 ${unresolved} 处未选定，不能提交` : '可以提交为正式规范'}</span>
+            <sp-button
+              variant="accent"
+              ?disabled=${unresolved > 0}
+              @click=${() => {
+                const result = this.store.commitMerge();
+                if (result.ok) { this.showMerge = false; this.flash('合并已写入正式规范'); }
+                else this.flash(result.error ?? '提交失败');
+              }}
+            >选定完成，写入正式规范</sp-button>
+          </footer>
+        </div>
+      </div>
+    `;
+  }
+
+  private renderConflict(conflict: MergeConflict, componentName: string): TemplateResult {
+    const fieldLabel = conflict.field ? FIELD_LABELS[conflict.field] ?? conflict.field : '整体取舍';
+    const kindLabel = {
+      'both-modified': '同一处两套值',
+      'added-both': '双方都新增',
+      'deleted-modified': '一方删除/一方修改'
+    }[conflict.kind];
+    return html`
+      <article class="conflict ${conflict.chosen ? `chosen-${conflict.chosen}` : ''}">
+        <div class="conflict-head">
+          <strong>${conflict.label}</strong>
+          <span class="pill review">${kindLabel}</span>
+          <span class="save-state">${componentName} · ${fieldLabel}</span>
+        </div>
+        <div class="conflict-options">
+          ${this.renderConflictOption(conflict, 'local')}
+          ${this.renderConflictOption(conflict, 'incoming')}
+        </div>
+      </article>
+    `;
+  }
+
+  private renderConflictOption(conflict: MergeConflict, side: MergeSide): TemplateResult {
+    const selected = conflict.chosen === side;
+    const label = side === 'local' ? conflict.localLabel : conflict.incomingLabel;
+    const value = side === 'local' ? conflict.localValue : conflict.incomingValue;
+    return html`
+      <button
+        type="button"
+        class="conflict-option ${selected ? 'selected' : ''}"
+        aria-pressed=${selected}
+        @click=${() => this.store.chooseConflictSide(conflict.id, side)}
+      >
+        <span class="conflict-side">${label}${selected ? ' · 已保留' : ''}</span>
+        <pre>${value || '（空）'}</pre>
+      </button>
+    `;
+  }
+
+  private pickBundleFile() {
+    const input = this.renderRoot.querySelector<HTMLInputElement>('input[type="file"]');
+    if (!input) return;
+    input.value = '';
+    input.click();
+  }
+
+  private async onBundleFilePicked(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      const parsed: unknown = JSON.parse(await file.text());
+      const result = this.store.importBundle(parsed);
+      if (result.ok) {
+        this.showMerge = true;
+        const count = result.report?.conflicts.length ?? 0;
+        this.flash(count ? `合并已挂起：${count} 处差异待选定` : '没有冲突，可直接写入正式规范');
+      } else {
+        this.flash(result.error ?? '稿包无法识别');
+      }
+    } catch {
+      this.flash('稿包不是合法 JSON，双方草稿均未改动');
+    }
+  }
+
+  private exportBundle() {
+    const blob = new Blob([this.store.exportBundleJson()], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `sologsb-1028-offline-bundle-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    this.flash('离线稿已导出，断网时可继续编辑');
   }
 
   private flash(message: string) {
