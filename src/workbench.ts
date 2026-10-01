@@ -1,8 +1,9 @@
 import { LitElement, css, html, nothing, type TemplateResult } from 'lit';
 import { repeat } from 'lit/directives/repeat.js';
 import { diffAgainstSnapshot } from './diff';
+import { formatValue, mergeDrafts, type ConflictResolution, type MergeConflict, type MergeResult } from './merge';
 import { SpecStore } from './store';
-import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue } from './types';
+import type { ComponentExample, ComponentSpec, PreviewDensity, PreviewTheme, PropertySpec, ValidationIssue, WorkspaceState } from './types';
 
 type EditorTab = 'overview' | 'api' | 'accessibility' | 'examples' | 'history';
 
@@ -13,7 +14,8 @@ export class SpecA11yWorkbench extends LitElement {
     previewTheme: { state: true },
     previewDensity: { state: true },
     toast: { state: true },
-    showValidation: { state: true }
+    showValidation: { state: true },
+    showMerge: { state: true }
   };
 
   private store = new SpecStore();
@@ -23,6 +25,12 @@ export class SpecA11yWorkbench extends LitElement {
   private previewDensity: PreviewDensity = 'regular';
   private toast = '';
   private showValidation = true;
+  private showMerge = false;
+  private mergeDraftText = '';
+  private mergeFileName = '';
+  private mergeResult: MergeResult | null = null;
+  private mergeResolution: ConflictResolution = {};
+  private mergeError = '';
   private toastTimer?: number;
 
   static styles = css`
@@ -116,6 +124,42 @@ export class SpecA11yWorkbench extends LitElement {
     .search-empty { padding: 20px 8px; color: var(--spectrum-gray-700); font-size: 13px; }
     .footer-hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); z-index: 30; background: #202020; color: white; border-radius: 999px; padding: 6px 12px; font-size: 11px; opacity: .9; }
     sp-toast { position: fixed; right: 18px; bottom: 18px; z-index: 50; }
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 100;
+      display: grid; place-items: center; padding: 24px;
+      background: rgb(20 28 45 / .55); backdrop-filter: blur(3px);
+    }
+    .modal {
+      width: min(720px, 100%); max-height: 88vh; overflow: auto;
+      background: var(--spectrum-gray-50); color: var(--spectrum-gray-900);
+      border-radius: 16px; border: 1px solid var(--spectrum-gray-300);
+      box-shadow: 0 24px 60px rgb(0 0 0 / .3); padding: 22px;
+    }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+    .modal-head h2 { margin: 0; font-size: 20px; }
+    .modal-hint { margin: 0 0 16px; color: var(--spectrum-gray-700); font-size: 13px; line-height: 1.6; }
+    .merge-import { display: grid; gap: 14px; }
+    .merge-file { margin: 0; font-size: 12px; color: var(--spectrum-gray-700); }
+    .merge-summary { margin-bottom: 14px; }
+    .merge-invalidated { margin: 8px 0 0; font-size: 12px; color: var(--spectrum-orange-700); }
+    .conflict-list { display: grid; gap: 12px; margin-bottom: 14px; }
+    .conflict-card { border: 1px solid var(--spectrum-gray-300); border-radius: 12px; padding: 14px; background: var(--spectrum-gray-100); }
+    .conflict-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+    .conflict-head strong { font-size: 14px; }
+    .conflict-delete { margin: 0 0 8px; font-size: 12px; color: var(--spectrum-orange-700); }
+    .conflict-options { display: grid; gap: 8px; }
+    .conflict-option {
+      display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; align-items: center;
+      border: 1px solid var(--spectrum-gray-400); border-radius: 10px; padding: 10px 12px; cursor: pointer;
+      background: var(--spectrum-gray-50);
+    }
+    .conflict-option.selected { border-color: var(--spectrum-blue-600); background: var(--spectrum-blue-100); box-shadow: 0 0 0 2px var(--spectrum-blue-200); }
+    .conflict-option input { grid-row: 1 / span 2; }
+    .conflict-side { font-size: 12px; font-weight: 700; }
+    .conflict-option code { font-size: 12px; white-space: pre-wrap; word-break: break-word; color: var(--spectrum-gray-800); }
+    .conflict-base { margin: 8px 0 0; font-size: 11px; color: var(--spectrum-gray-700); }
+    .conflict-base code { background: var(--spectrum-gray-200); padding: 1px 5px; border-radius: 4px; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     @media (max-width: 1180px) {
       .layout { grid-template-columns: 230px minmax(0, 1fr); }
       .inspector { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--spectrum-gray-300); grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -204,6 +248,7 @@ export class SpecA11yWorkbench extends LitElement {
               <sp-button variant="secondary" ?disabled=${!this.store.canUndo} @click=${() => this.store.undo()}>撤销</sp-button>
               <sp-button variant="secondary" ?disabled=${!this.store.canRedo} @click=${() => this.store.redo()}>重做</sp-button>
               <sp-button variant="accent" @click=${() => { this.store.createSnapshot('工具栏保存'); this.flash('版本已保存'); }}>保存版本</sp-button>
+              <sp-button variant="secondary" @click=${() => this.openMerge()}>合并离线草稿</sp-button>
               <span class="save-state">本地自动保存 · ${selected?.revision ?? 0} 版</span>
             </div>
           </header>
@@ -232,6 +277,7 @@ export class SpecA11yWorkbench extends LitElement {
             </aside>
           </div>
           ${this.toast ? html`<sp-toast open variant="positive" timeout="3000">${this.toast}</sp-toast>` : nothing}
+          ${this.showMerge ? this.renderMergeModal() : nothing}
           <div class="footer-hint">⌘/Ctrl+Z 撤销 · ⇧⌘/Ctrl+Z 重做 · ⌘/Ctrl+K 搜索 · Alt+1–5 切换面板</div>
         </div>
       </sp-theme>
@@ -441,6 +487,164 @@ export class SpecA11yWorkbench extends LitElement {
     const query = this.query.trim().toLowerCase();
     if (!query) return this.store.state.components;
     return this.store.state.components.filter((component) => JSON.stringify(component).toLowerCase().includes(query));
+  }
+
+  // ---- 离线草稿合并 ----
+
+  private openMerge() {
+    this.showMerge = true;
+    this.mergeDraftText = '';
+    this.mergeFileName = '';
+    this.mergeResult = null;
+    this.mergeResolution = {};
+    this.mergeError = '';
+  }
+
+  private closeMerge() {
+    this.showMerge = false;
+  }
+
+  private async onMergeFile(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    this.mergeFileName = file.name;
+    this.mergeDraftText = await file.text();
+    this.mergeError = '';
+    this.mergeResult = null;
+  }
+
+  private onMergeText(event: Event) {
+    this.mergeDraftText = (event.currentTarget as HTMLTextAreaElement).value;
+    this.mergeError = '';
+    this.mergeResult = null;
+  }
+
+  private parseMerge() {
+    let incoming: WorkspaceState;
+    try {
+      incoming = JSON.parse(this.mergeDraftText) as WorkspaceState;
+    } catch {
+      this.mergeError = '草稿不是有效的 JSON，请检查后重试。双方草稿均已保留。';
+      this.mergeResult = null;
+      return;
+    }
+    const result = mergeDrafts(this.store.state, incoming);
+    if (!result.ok) {
+      this.mergeError = `${result.error ?? '合并失败'}。双方草稿均已保留，可修改后重试。`;
+      this.mergeResult = null;
+      return;
+    }
+    this.mergeResult = result;
+    this.mergeError = '';
+    if (!result.conflicts.length) {
+      // 无冲突：自动接上，直接写入正式规范。
+      this.store.applyMerge(result, {});
+      this.flash(`已自动合并 ${result.changes.length} 处改动`);
+      this.closeMerge();
+    }
+  }
+
+  private setConflictResolution(conflictId: string, side: 'local' | 'incoming') {
+    this.mergeResolution = { ...this.mergeResolution, [conflictId]: side };
+  }
+
+  private applyMerge() {
+    if (!this.mergeResult) return;
+    const unresolved = this.mergeResult.conflicts.filter((c) => !this.mergeResolution[c.id]);
+    if (unresolved.length) {
+      this.mergeError = `还有 ${unresolved.length} 处冲突未选定，请先选择保留哪一方的取值。`;
+      return;
+    }
+    this.store.applyMerge(this.mergeResult, this.mergeResolution);
+    this.flash('合并完成，共同祖先已更新');
+    this.closeMerge();
+  }
+
+  private renderMergeModal(): TemplateResult {
+    const result = this.mergeResult;
+    const conflicts = result?.conflicts ?? [];
+    const allResolved = conflicts.length > 0 && conflicts.every((c) => this.mergeResolution[c.id]);
+    return html`
+      <div class="modal-overlay" @click=${(event: Event) => { if (event.target === event.currentTarget) this.closeMerge(); }}>
+        <div class="modal" role="dialog" aria-modal="true" aria-label="合并离线草稿">
+          <div class="modal-head">
+            <h2>合并离线草稿</h2>
+            <sp-action-button size="s" label="关闭" @click=${() => this.closeMerge()}>×</sp-action-button>
+          </div>
+          <p class="modal-hint">导入对方断网编辑后带回的草稿（JSON）。系统按稳定编号匹配组件、属性和示例：彼此改的不是同处会自动接上；同一处出现两套取值时保留双方，由你选定后才写入正式规范。</p>
+
+          ${!result ? html`
+            <div class="merge-import">
+              <label class="field"><span>选择草稿文件</span><input type="file" accept="application/json,.json" @change=${(e: Event) => this.onMergeFile(e)} /></label>
+              ${this.mergeFileName ? html`<p class="merge-file">已选择：${this.mergeFileName}</p>` : nothing}
+              <label class="field"><span>或粘贴草稿 JSON</span><textarea .value=${this.mergeDraftText} @input=${(e: Event) => this.onMergeText(e)} placeholder='{"components": [...]}'></textarea></label>
+              ${this.mergeError ? html`<div class="issue error">${this.mergeError}</div>` : nothing}
+              <div class="modal-actions">
+                <sp-button variant="secondary" @click=${() => this.closeMerge()}>取消</sp-button>
+                <sp-button variant="accent" ?disabled=${!this.mergeDraftText.trim()} @click=${() => this.parseMerge()}>解析并合并</sp-button>
+              </div>
+            </div>
+          ` : html`
+            <div class="merge-summary">
+              <div class="issue info"><strong>合并预览</strong>
+                自动接上 ${result.changes.length} 处改动；
+                ${conflicts.length ? `${conflicts.length} 处冲突待选定；` : '无冲突；'}
+                ${result.invalidatedExamples.length} 个示例因属性改动将失效重算。
+              </div>
+              ${result.invalidatedExamples.length ? html`<p class="merge-invalidated">失效示例：${result.invalidatedExamples.map((id) => {
+                for (const comp of result.merged.components) {
+                  const ex = comp.examples.find((e) => e.id === id);
+                  if (ex) return ex.title;
+                }
+                return id;
+              }).join('、')}</p>` : nothing}
+            </div>
+
+            ${conflicts.length ? html`
+              <div class="conflict-list">
+                ${conflicts.map((conflict) => this.renderConflict(conflict))}
+              </div>
+            ` : html`<div class="issue info">没有需要选定的冲突。</div>`}
+
+            ${this.mergeError ? html`<div class="issue error">${this.mergeError}</div>` : nothing}
+            <div class="modal-actions">
+              <sp-button variant="secondary" @click=${() => { this.mergeResult = null; this.mergeError = ''; }}>返回修改草稿</sp-button>
+              <sp-button variant="accent" ?disabled=${!allResolved} @click=${() => this.applyMerge()}>应用合并</sp-button>
+            </div>
+          `}
+        </div>
+      </div>
+    `;
+  }
+
+  private renderConflict(conflict: MergeConflict): TemplateResult {
+    const selected = this.mergeResolution[conflict.id];
+    const sideLabel = conflict.entityType === 'component' ? '组件' : conflict.entityType === 'property' ? '属性' : '示例';
+    return html`
+      <div class="conflict-card">
+        <div class="conflict-head">
+          <strong>${sideLabel}「${conflict.entityLabel}」</strong>
+          <span class="pill review">${conflict.fieldLabel} · 双方取值不同</span>
+        </div>
+        ${conflict.kind === 'delete' ? html`
+          <p class="conflict-delete">一方删除了该${sideLabel}，另一方保留并修改。请选定保留哪一方：</p>
+        ` : nothing}
+        <div class="conflict-options">
+          <label class="conflict-option ${selected === 'local' ? 'selected' : ''}">
+            <input type="radio" name=${conflict.id} .checked=${selected === 'local'} @change=${() => this.setConflictResolution(conflict.id, 'local')} />
+            <span class="conflict-side">本方（当前草稿）</span>
+            <code>${conflict.kind === 'delete' ? '保留修改' : formatValue(conflict.localValue)}</code>
+          </label>
+          <label class="conflict-option ${selected === 'incoming' ? 'selected' : ''}">
+            <input type="radio" name=${conflict.id} .checked=${selected === 'incoming'} @change=${() => this.setConflictResolution(conflict.id, 'incoming')} />
+            <span class="conflict-side">对方（带回草稿）</span>
+            <code>${conflict.kind === 'delete' ? '删除' : formatValue(conflict.incomingValue)}</code>
+          </label>
+        </div>
+        ${conflict.kind === 'field' && conflict.baseValue !== undefined && conflict.baseValue !== null ? html`<p class="conflict-base">共同祖先取值：<code>${formatValue(conflict.baseValue)}</code></p>` : nothing}
+      </div>
+    `;
   }
 
   private hasStaleExamples(component: ComponentSpec): boolean {

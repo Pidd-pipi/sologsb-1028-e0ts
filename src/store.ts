@@ -1,4 +1,5 @@
 import { createInitialState } from './data';
+import { baseFromState, resolveMerge, type ConflictResolution, type MergeResult } from './merge';
 import type { ComponentSnapshot, ComponentSpec, ValidationIssue, WorkspaceState } from './types';
 
 const STORAGE_KEY = 'sologsb-1028-workspace-v1';
@@ -251,8 +252,22 @@ export class SpecStore extends EventTarget {
     this.undoStack = [];
     this.redoStack = [];
     this.state = createInitialState();
+    this.state.base = baseFromState(this.state);
     this.persist(false);
     this.emit();
+  }
+
+  /**
+   * 应用合并结果。合并在用户选定冲突前不会写入正式规范；
+   * 应用后把共同祖先更新为合并结果，作为下次断网编辑的基准。
+   */
+  applyMerge(result: MergeResult, resolution: ConflictResolution) {
+    const merged = resolveMerge(result, resolution);
+    this.commit('合并离线草稿', (state) => {
+      state.components = merged.components;
+      state.selectedId = merged.selectedId;
+      state.base = baseFromState(merged);
+    });
   }
 
   private commit(label: string, mutator: (state: WorkspaceState) => void) {
@@ -271,11 +286,18 @@ export class SpecStore extends EventTarget {
   private load(): WorkspaceState {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
-      if (saved) return JSON.parse(saved) as WorkspaceState;
+      if (saved) {
+        const parsed = JSON.parse(saved) as WorkspaceState;
+        // 旧版本草稿没有 base，首次加载时以当前内容作为共同祖先。
+        if (!parsed.base) parsed.base = baseFromState(parsed);
+        return parsed;
+      }
     } catch {
       // A corrupted local draft falls back to the bundled demo data.
     }
-    return createInitialState();
+    const initial = createInitialState();
+    initial.base = baseFromState(initial);
+    return initial;
   }
 
   private persist(_notify = true) {

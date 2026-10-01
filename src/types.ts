@@ -50,6 +50,13 @@ export interface ComponentSnapshot {
 export interface WorkspaceState {
   components: ComponentSpec[];
   selectedId: string;
+  /**
+   * 最近一次同步时的工作区快照（去掉 snapshots）。
+   * 断网编辑后，三方合并以它为共同祖先；合并成功后更新为合并结果。
+   */
+  base?: {
+    components: Array<Omit<ComponentSpec, 'snapshots'>>;
+  };
 }
 
 export interface ValidationIssue {
